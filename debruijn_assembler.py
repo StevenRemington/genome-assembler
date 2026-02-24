@@ -69,16 +69,19 @@ def deduplicate_contigs(contigs, k=31):
                 
     removed = len(contigs) - len(unique_contigs)
     logger.info(f"Deduplication removed {removed} redundant/mirrored contigs.")
-    return unique_contigs
+    return unique_contigsOka
 
 
 class DeBruijnAssembler:
     """Extreme memory-optimized De Bruijn Graph using Implicit Bitmasks."""
     
-    def __init__(self, k=31):
+    def __init__(self, k=31, min_coverage=15, num_anchors=10):
         self.k = k
+        self.min_coverage = min_coverage
+        self.num_anchors = num_anchors
         self.kmer_mask = (1 << (2 * self.k)) - 1
         self.node_mask = (1 << (2 * (self.k - 1))) - 1
+        self.logger = logging.getLogger("GenomeAssembler.DeBruijn")
 
     def _build_graph(self, read_stream, min_coverage=3):
         """Builds a vectorized graph with STRICT k-mer edge filtering."""
