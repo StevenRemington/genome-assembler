@@ -1,0 +1,34 @@
+# .gitignore
+
+# --------------------------
+# Bioinformatics Data Files
+# --------------------------
+# Never commit raw sequence data or large intermediate files
+*.fasta
+*.fa
+*.fastq
+*.fq
+*.sam
+*.bam
+*.vcf
+*.gz
+*.log
+
+# --------------------------
+# Python Core & Environments
+# --------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.venv/
+
+# --------------------------
+# IDEs and OS Files
+# --------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

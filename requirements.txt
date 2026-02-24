@@ -1,0 +1,8 @@
+# requirements.txt
+
+# Biopython handles reading, writing, and parsing 
+# biological sequence formats like FASTA and FASTQ.
+biopython>=1.81
+
+# Progress bar
+tqdm
