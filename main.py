@@ -1,5 +1,6 @@
 # main.py
 
+import os
 import argparse
 import logging
 from datetime import datetime
@@ -23,8 +24,12 @@ def setup_logger(enable_file_logging):
     
     # File handler (Log file) - Save all granular DEBUG info
     if enable_file_logging:
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True) # Creates the 'logs' folder if it doesn't exist
+        
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"assembly_run_{timestamp}.log"
+        filename = os.path.join(log_dir, f"assembly_run_{timestamp}.log")
+        
         file_handler = logging.FileHandler(filename)
         file_handler.setLevel(logging.DEBUG) 
         file_handler.setFormatter(formatter)
@@ -81,8 +86,6 @@ def main():
     parser.add_argument("-m", "--mismatches", type=int, default=0)
     parser.add_argument("-k", "--kmer", type=int, default=5)
     parser.add_argument("-s", "--save", type=str, help="Path to save the assembled FASTA file", default="assembled_genome.fasta")
-    
-    # New Log Argument
     parser.add_argument("-log", "--log", action="store_true", help="Generate a detailed timestamped .log file")
     
     args = parser.parse_args()
@@ -94,7 +97,6 @@ def main():
         enable_log=args.log,
         output_path=args.save  # Pass the save path here
     )
-
 
 if __name__ == "__main__":
     main()

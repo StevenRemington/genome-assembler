@@ -243,7 +243,7 @@ class DeBruijnAssembler:
         # Sort contigs by length (longest first)
         final_contigs.sort(key=len, reverse=True)
         
-        # --- NEW DEDUPLICATION STEP ---
+        # Deduplication step
         final_contigs = deduplicate_contigs(final_contigs)
         
         total_bases = sum(len(c) for c in final_contigs)
