@@ -3,6 +3,9 @@ from collections import defaultdict
 from tqdm import tqdm
 import numpy as np
 
+# --- NEW: Import the metrics utility ---
+from metrics import calculate_assembly_metrics
+
 class DNAEncoder:
     """Handles bit-packing DNA sequences into highly memory-efficient integers."""
     
@@ -30,7 +33,7 @@ class DNAEncoder:
 class DeBruijnAssembler:
     """Extreme memory-optimized De Bruijn Graph using Implicit Bitmasks."""
     
-    def __init__(self, k=31, min_coverage=15, num_anchors=10):
+    def __init__(self, k=31, min_coverage=20, num_anchors=10):
         self.k = k
         self.min_coverage = min_coverage
         self.num_anchors = num_anchors
@@ -120,6 +123,50 @@ class DeBruijnAssembler:
         working_edges = edges_arr.copy()
         active_nodes = np.where(working_edges > 0)[0]
 
+        def try_pop_bubble(start_idx, out_mask):
+            """
+            Attempts to find a converging path within k steps (a sequencing error bubble).
+            Returns (convergence_node, path1_nodes, path2_nodes, branch1_char, branch2_char)
+            """
+            branches = [bit for bit in range(4) if out_mask & (1 << bit)]
+            
+            def trace_path(start_char):
+                p = []
+                curr = pointers[start_idx, start_char]
+                if curr == -1: return p
+                p.append(curr)
+                
+                # A single SNP creates a bubble of exactly length 'k'
+                # We search slightly past k (k+2) for safety
+                for _ in range(self.k + 2): 
+                    o_mask = int(working_edges[curr])
+                    if bin(o_mask).count('1') != 1:
+                        break
+                    next_char = 0
+                    for b in range(4):
+                        if o_mask & (1 << b):
+                            next_char = b
+                            break
+                    curr = pointers[curr, next_char]
+                    if curr == -1: break
+                    p.append(curr)
+                return p
+                
+            p1 = trace_path(branches[0])
+            p2 = trace_path(branches[1])
+            
+            if not p1 or not p2:
+                return None, None, None, None, None
+                
+            set_p1 = set(p1)
+            for i, node in enumerate(p2):
+                if node in set_p1:
+                    idx1 = p1.index(node)
+                    idx2 = i
+                    return node, p1[:idx1], p2[:idx2], branches[0], branches[1]
+                    
+            return None, None, None, None, None
+
         with tqdm(total=len(active_nodes), desc="Traversing Graph") as pbar:
             for start_idx in active_nodes:
                 if working_edges[start_idx] == 0:
@@ -130,30 +177,60 @@ class DeBruijnAssembler:
                 
                 while True:
                     out_mask = int(working_edges[curr_idx])
+                    out_count = bin(out_mask).count('1')
                     
-                    if bin(out_mask).count('1') != 1:
+                    if out_count == 0:
                         break
                     
-                    char_val = 0
-                    for bit in range(4):
-                        if out_mask & (1 << bit):
-                            char_val = bit
-                            break
-                            
-                    working_edges[curr_idx] &= ~(1 << char_val) & 0xFF
-                    pbar.update(1)
-                    
-                    next_idx = pointers[curr_idx, char_val]
-                    
-                    if next_idx == -1:
-                        break 
+                    if out_count == 1:
+                        # STANDARD TRAVERSAL
+                        char_val = 0
+                        for bit in range(4):
+                            if out_mask & (1 << bit):
+                                char_val = bit
+                                break
+                                
+                        working_edges[curr_idx] &= ~(1 << char_val) & 0xFF
+                        pbar.update(1)
                         
-                    # Stop if multiple paths merge into this node
-                    if in_degrees[next_idx] > 1:
-                        break
+                        next_idx = pointers[curr_idx, char_val]
+                        
+                        if next_idx == -1:
+                            break 
+                            
+                        # Stop if multiple paths merge into this node
+                        if in_degrees[next_idx] > 1:
+                            break
 
-                    curr_idx = next_idx
-                    path.append(kmers_arr[curr_idx])
+                        curr_idx = next_idx
+                        path.append(kmers_arr[curr_idx])
+                        
+                    elif out_count == 2:
+                        # BUBBLE DETECTION & REMOVAL
+                        conv_node, p1_nodes, p2_nodes, b1, b2 = try_pop_bubble(curr_idx, out_mask)
+                        
+                        if conv_node is not None:
+                            # 1. Clear the start edges
+                            working_edges[curr_idx] &= ~(1 << b1) & 0xFF
+                            working_edges[curr_idx] &= ~(1 << b2) & 0xFF
+                            pbar.update(1)
+                            
+                            # 2. Clear all internal bubble edges to prevent re-traversal
+                            for n in p1_nodes + p2_nodes:
+                                working_edges[n] = 0
+                                
+                            # 3. Append Path 1 (arbitrary choice) to bridge the gap
+                            for n in p1_nodes:
+                                path.append(kmers_arr[n])
+                                
+                            # 4. Jump directly to the convergence node!
+                            curr_idx = conv_node
+                            path.append(kmers_arr[curr_idx])
+                        else:
+                            # True biological divergence, stop traversal safely to prevent chimeras
+                            break
+                    else:
+                        break # Out-degree > 2 (Complex repeat)
                     
                 if len(path) >= self.k:
                     all_paths.append(path)
@@ -218,13 +295,12 @@ class DeBruijnAssembler:
         
         final_contigs.sort(key=len, reverse=True)
         
-        # PROPERLY SCOPED CALL TO THE INSTANCE METHOD
         final_contigs = self._deduplicate_contigs(final_contigs)
         
         total_bases = sum(len(c) for c in final_contigs)
         longest_contig = len(final_contigs[0]) if final_contigs else 0
-
-        from metrics import calculate_assembly_metrics
+        
+        # --- NEW: Use the imported function ---
         quality_metrics = calculate_assembly_metrics(final_contigs)
             
         stats = {
