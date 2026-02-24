@@ -57,6 +57,26 @@ class TestFastaIO:
         # Biopython will fail to parse a FASTA as a FASTQ, should return empty list
         assert reads == []
 
+def test_assembly_metrics():
+    from metrics import calculate_assembly_metrics # adjust import as needed
+    
+    # Total length = 100. Half length = 50.
+    contigs = [
+        "A" * 40, # 40
+        "G" * 30, # 30  (Running sum: 70 -> Passes 50 mark here)
+        "C" * 20, # 20
+        "T" * 10  # 10
+    ]
+    
+    metrics = calculate_assembly_metrics(contigs)
+    
+    # The contig that pushes the sum >= 50 is the 30-length one.
+    assert metrics["N50"] == "30"
+    # It took 2 contigs to reach the 50% mark
+    assert metrics["L50"] == "2"
+    # GC content should be 50% (30 Gs + 20 Cs out of 100)
+    assert metrics["GC Content"] == "50.00%"
+
 
 # ==========================================
 # GREEDY ASSEMBLER TESTS

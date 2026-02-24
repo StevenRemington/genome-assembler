@@ -223,6 +223,9 @@ class DeBruijnAssembler:
         
         total_bases = sum(len(c) for c in final_contigs)
         longest_contig = len(final_contigs[0]) if final_contigs else 0
+
+        from metrics import calculate_assembly_metrics
+        quality_metrics = calculate_assembly_metrics(final_contigs)
             
         stats = {
             "Algorithm": "De Bruijn Graph (Linear Contig Extraction)",
@@ -231,7 +234,10 @@ class DeBruijnAssembler:
             "Longest Contig": f"{longest_contig:,}",
             "Total Contigs": len(final_contigs),
             "Total Filtered Edges": total_edges,
-            "Data Discarded": f"{discarded} short reads"
+            "Data Discarded": f"{discarded} short reads",
+            "N50": quality_metrics["N50"],
+            "L50": quality_metrics["L50"],
+            "GC Content": quality_metrics["GC Content"]
         }
         
         self.logger.info(f"Assembly completed. Total Bases: {total_bases:,}. Contigs: {len(final_contigs)}.")
