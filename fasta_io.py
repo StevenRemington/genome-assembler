@@ -38,13 +38,16 @@ class FastaIO:
     def stream(filepath, file_format="fastq"):
         """
         Generates sequence data one read at a time to save memory.
-        Perfect for De Bruijn graph construction.
         """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Sequence file not found: {filepath}")
+            
         try:
             for record in SeqIO.parse(filepath, file_format):
                 yield str(record.seq)
-        except Exception as e:
-            print(f"Error streaming file: {e}")
+        except ValueError as e:
+            # Raise a clear diagnostic error if Biopython chokes on the format
+            raise ValueError(f"Failed to parse {filepath} as {file_format}. Is the format correct? Details: {e}")
     
     @staticmethod
     def write(filepath, sequences, header_prefix="contig"):

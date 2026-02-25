@@ -38,13 +38,17 @@ def setup_logger(enable_file_logging):
         
     return logger
 
-def print_stats(stats):
-    """Helper to cleanly print the statistics dictionaries."""
-    print(f"\n[{stats['Algorithm']} Assembly Statistics]")
+def print_stats(stats, logger):
+    """Cleanly formats statistics and ensures they are written to the log file."""
+    if not stats:
+        logger.error("No statistics generated. Assembly may have failed.")
+        return
+
+    logger.info(f"\n[{stats.get('Algorithm', 'Unknown')} Assembly Statistics]")
     for key, value in stats.items():
         if key != "Algorithm":
-            print(f"  - {key}: {value}")
-    print("-" * 40)
+            logger.info(f"  - {key}: {value}")
+    logger.info("-" * 40)
 
 def run_pipeline(filepath, file_format, min_overlap, max_mismatches, kmer_size, assembler_choice, enable_log, output_path):
     logger = setup_logger(enable_log)
@@ -66,29 +70,44 @@ def run_pipeline(filepath, file_format, min_overlap, max_mismatches, kmer_size, 
 
     # --- 2. Run De Bruijn Assembler ---
     if assembler_choice in ["debruijn", "both"]:
-        read_stream = FastaIO.stream(filepath, file_format=file_format)
-        debruijn_assembler = DeBruijnAssembler(k=kmer_size)
-        debruijn_contigs, debruijn_stats = debruijn_assembler.assemble(read_stream)
-        print_stats(debruijn_stats)
+        try:
+            read_stream = FastaIO.stream(filepath, file_format=file_format)
+            debruijn_assembler = DeBruijnAssembler(k=kmer_size, min_coverage=args.min_cov)
+            debruijn_contigs, debruijn_stats = debruijn_assembler.assemble(read_stream)
+            print_stats(debruijn_stats, logger)
+        except Exception as e:
+            logger.error(f"Assembly pipeline failed: {e}")
+            return
         
-        # Save the results!
+        # Save the results ONLY if contigs were generated
         if output_path and debruijn_contigs:
             success = FastaIO.write(output_path, debruijn_contigs, header_prefix="debruijn_contig")
             if success:
                 logger.info(f"Assembled sequence saved to: {output_path}")
+        else:
+            logger.warning("No contigs were generated. Output file was not created.")
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble genome fragments with full logging.")
     parser.add_argument("filepath", type=str, help="Path to the input sequence file (.fasta or .fastq)")
     parser.add_argument("-f", "--format", type=str, choices=["fasta", "fastq"], default="fastq")
     parser.add_argument("-a", "--assembler", type=str, choices=["greedy", "debruijn", "both"], default="both")
-    parser.add_argument("-o", "--overlap", type=int, default=10)
-    parser.add_argument("-m", "--mismatches", type=int, default=0)
-    parser.add_argument("-k", "--kmer", type=int, default=5)
+    
+    # Expose coverage threshold
+    parser.add_argument("-c", "--min-cov", type=int, default=15, help="Minimum k-mer coverage threshold")
+    parser.add_argument("-k", "--kmer", type=int, default=31, help="K-mer size (Max: 31)")
+    
     parser.add_argument("-s", "--save", type=str, help="Path to save the assembled FASTA file", default="assembled_genome.fasta")
-    parser.add_argument("-log", "--log", action="store_true", help="Generate a detailed timestamped .log file")
+    # Fixed flag to standard format
+    parser.add_argument("--log", action="store_true", help="Generate a detailed timestamped .log file")
     
     args = parser.parse_args()
+    
+    # Proactive Input Validation
+    if args.kmer > 31:
+        parser.error("K-mer size cannot exceed 31 due to 64-bit memory optimization limits.")
+    if not os.path.exists(args.filepath):
+        parser.error(f"Input file not found: {args.filepath}")
     
     run_pipeline(
         filepath=args.filepath, file_format=args.format,
