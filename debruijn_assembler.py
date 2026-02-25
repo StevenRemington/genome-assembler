@@ -81,6 +81,7 @@ class DeBruijnAssembler:
         self.k = k
         self.min_coverage = min_coverage
         self.num_anchors = num_anchors
+        self.min_contig_length = 2 * self.k
         
         # Bitmasks used to rapidly drop prefix/suffix characters without string slicing
         self.kmer_mask = (1 << (2 * self.k)) - 1
@@ -128,6 +129,11 @@ class DeBruijnAssembler:
         
         # Sorting groups identical k-mers together, enabling fast C-level counting
         full_kmers_arr.sort()
+
+        #  Safe Empty Graph Check
+        if len(full_kmers_arr) == 0:
+            self.logger.warning("No valid k-mers extracted. Graph is empty.")
+            return np.array([], dtype=np.uint64), np.array([], dtype=np.uint8), 0, short_reads_discarded
         
         self.logger.info("Compacting and filtering TRUE noise...")
         # Boolean mask indicating where the value changes (i.e., a new unique k-mer starts)
@@ -140,6 +146,10 @@ class DeBruijnAssembler:
         keep_mask = counts >= self.min_coverage
         valid_full_kmers = full_kmers_arr[unique_indices][keep_mask]
         del full_kmers_arr
+
+        if len(valid_full_kmers) == 0:
+            self.logger.warning("No valid k-mers survived filtering. Graph is empty.")
+            return np.array([], dtype=np.uint64), np.array([], dtype=np.uint8), 0, short_reads_discarded
         
         self.logger.info("Extracting graph edges...")
         # The node (prefix) is the first k-1 characters (shift right by 2 to drop the last char)
@@ -262,6 +272,13 @@ class DeBruijnAssembler:
         working_edges = edges_arr.copy()
         active_nodes = np.where(working_edges > 0)[0]
 
+        # Sort active nodes to start at true sources (in_degree == 0) first.
+        # This prevents the walker from starting in the middle of a sequence,
+        # which accidentally fragments contigs and triggers false tip-removals.
+        active_in_degrees = in_degrees[active_nodes]
+        sorted_indices = np.argsort(active_in_degrees)
+        active_nodes = active_nodes[sorted_indices]
+
         with tqdm(total=len(active_nodes), desc="Traversing Graph") as pbar:
             for start_idx in active_nodes:
                 if working_edges[start_idx] == 0:
@@ -291,10 +308,16 @@ class DeBruijnAssembler:
                         next_idx = pointers[curr_idx, char_val]
                         
                         if next_idx == -1:
-                            break 
+                            # We hit a dead-end sink. Construct the final node and append it 
+                            # so we don't drop the last character of the genome!
+                            terminal_node = ((kmers_arr[curr_idx] << 2) & self.node_mask) | char_val
+                            path.append(terminal_node)
+                            break
                             
                         # Stop to prevent Chimeras
                         if in_degrees[next_idx] > 1:
+                            # Preserve the final k-mer of this path before breaking
+                            path.append(kmers_arr[next_idx])
                             break
 
                         curr_idx = next_idx
@@ -327,7 +350,7 @@ class DeBruijnAssembler:
                         break # Out-degree > 2 (Complex repetitive region, stop safely)
                     
                 # Graph Cleaning Part 2: Tip Removal
-                if len(path) >= 2 * self.k:
+                if len(path) >= self.min_contig_length:
                     all_paths.append(path)
                 elif len(path) >= self.k:
                     tips_removed += 1

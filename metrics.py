@@ -9,7 +9,7 @@ def calculate_assembly_metrics(contigs):
         dict: A dictionary of computed metrics.
     """
     if not contigs:
-        return {"N50": 0, "L50": 0, "GC Content (%)": 0.0}
+        return {"N50": "0", "L50": "0", "GC Content": "0.00%"}
 
     # 1. Sort lengths in descending order
     lengths = sorted([len(c) for c in contigs], reverse=True)
