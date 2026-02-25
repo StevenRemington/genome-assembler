@@ -165,19 +165,12 @@ class DeBruijnAssembler:
         self.logger.info(f"Graph built: {len(final_kmers):,} nodes, {total_edges:,} edges.")
         return final_kmers, final_edges, total_edges, short_reads_discarded
 
-    def _extract_contigs(self, kmers_arr, edges_arr):
+    def _build_transition_pointers(self, kmers_arr, edges_arr):
         """
-        Vectorized O(1) Contig Extractor using pre-computed memory pointers.
+        Pre-computes O(1) transition pointers and node in-degrees.
         
-        Why: Calling binary search (`np.searchsorted`) at every step of the graph traversal 
-        is too slow. This pre-computes where every edge leads so traversal takes exactly O(1) time.
-        
-        Args:
-            kmers_arr (np.array): The sorted unique nodes (prefixes).
-            edges_arr (np.array): The bitwise edge definitions corresponding to the nodes.
-            
-        Returns:
-            tuple: (all_paths (list[list[int]]), tips_removed (int))
+        Why: Extracts the dense NumPy matrix math out of the traversal logic. 
+        This isolated method can now be easily unit-tested for edge-case accuracy.
         """
         n_nodes = len(kmers_arr)
         self.logger.info(f"Step 2/4: Pre-computing O(1) transition pointers for {n_nodes:,} nodes...")
@@ -193,13 +186,11 @@ class DeBruijnAssembler:
         # Find exactly where that destination node lives in the kmers_arr array
         dest_idx = np.searchsorted(kmers_arr, v_vals)
         
-        # Ensure the destination actually exists (it might have been filtered out due to low coverage)
+        # Ensure the destination actually exists
         valid_dest_mask = dest_idx < n_nodes
         valid_dest_mask[valid_dest_mask] = kmers_arr[dest_idx[valid_dest_mask]] == v_vals[valid_dest_mask]
         
-        # Track In-Degrees: Count how many arrows point INTO a node.
-        # Why: If in-degree > 1, multiple paths converge. We MUST stop traversal here to prevent 
-        # accidentally merging unrelated chromosomes (Chimeras).
+        # Track In-Degrees to prevent Chimeras
         in_degrees = np.zeros(n_nodes, dtype=np.int32)
         np.add.at(in_degrees, dest_idx[valid_dest_mask], 1)
 
@@ -207,63 +198,69 @@ class DeBruijnAssembler:
         pointers = np.full((n_nodes, 4), -1, dtype=np.int32)
         pointers[source_idx[valid_dest_mask], char_idx[valid_dest_mask]] = dest_idx[valid_dest_mask]
         
-        del valid_edges, source_idx, char_idx, u_vals, v_vals, dest_idx, valid_dest_mask
+        return pointers, in_degrees
+
+    def _try_pop_bubble(self, start_idx, out_mask, pointers, working_edges):
+        """
+        Graph Cleaning Part 1: Bubble Popping.
+        
+        Attempts to find a converging path within k steps (a sequencing error bubble).
+        Extracted to a class method to allow for isolated unit testing.
+        """
+        branches = [bit for bit in range(4) if out_mask & (1 << bit)]
+        
+        def trace_path(start_char):
+            p = []
+            curr = pointers[start_idx, start_char]
+            if curr == -1: return p
+            p.append(curr)
+            
+            # Search up to k+2 steps ahead to account for complex but tiny variants
+            for _ in range(self.k + 2): 
+                o_mask = int(working_edges[curr])
+                if bin(o_mask).count('1') != 1:
+                    break
+                next_char = 0
+                for b in range(4):
+                    if o_mask & (1 << b):
+                        next_char = b
+                        break
+                curr = pointers[curr, next_char]
+                if curr == -1: break
+                p.append(curr)
+            return p
+            
+        p1 = trace_path(branches[0])
+        p2 = trace_path(branches[1])
+        
+        if not p1 or not p2:
+            return None, None, None, None, None
+            
+        # Check if the paths intersect (converge)
+        set_p1 = set(p1)
+        for i, node in enumerate(p2):
+            if node in set_p1:
+                idx1 = p1.index(node)
+                idx2 = i
+                return node, p1[:idx1], p2[:idx2], branches[0], branches[1]
+                
+        return None, None, None, None, None
+
+    def _extract_contigs(self, kmers_arr, edges_arr):
+        """
+        Vectorized O(1) Contig Extractor.
+        
+        Why: Now strictly responsible for orchestrating the traversal loop. 
+        It delegates pointer math and bubble logic to their respective helpers.
+        """
+        # 1. Delegate pointer building
+        pointers, in_degrees = self._build_transition_pointers(kmers_arr, edges_arr)
         
         self.logger.info("Step 3/4: Extracting Linear Contigs (Lightning Speed)...")
         all_paths = []
         tips_removed = 0 
         working_edges = edges_arr.copy()
         active_nodes = np.where(working_edges > 0)[0]
-
-        def try_pop_bubble(start_idx, out_mask):
-            """
-            Graph Cleaning Part 1: Bubble Popping.
-            
-            Why: A single 1-base sequencing error causes the graph to branch into two paths 
-            that converge exactly k steps later. If we don't 'pop' the bubble, the assembly shatters.
-            This method looks ahead to see if the two branches reconverge.
-            """
-            branches = [bit for bit in range(4) if out_mask & (1 << bit)]
-            
-            def trace_path(start_char):
-                p = []
-                curr = pointers[start_idx, start_char]
-                if curr == -1: return p
-                p.append(curr)
-                
-                # We search up to k+2 steps ahead (slightly more than the minimum required k steps 
-                # to account for complex but tiny variants).
-                for _ in range(self.k + 2): 
-                    o_mask = int(working_edges[curr])
-                    # If the sub-path branches AGAIN, it's too complex to be a simple error. Stop.
-                    if bin(o_mask).count('1') != 1:
-                        break
-                    next_char = 0
-                    for b in range(4):
-                        if o_mask & (1 << b):
-                            next_char = b
-                            break
-                    curr = pointers[curr, next_char]
-                    if curr == -1: break
-                    p.append(curr)
-                return p
-                
-            p1 = trace_path(branches[0])
-            p2 = trace_path(branches[1])
-            
-            if not p1 or not p2:
-                return None, None, None, None, None
-                
-            # Check if the paths intersect (converge)
-            set_p1 = set(p1)
-            for i, node in enumerate(p2):
-                if node in set_p1:
-                    idx1 = p1.index(node)
-                    idx2 = i
-                    # Return the intersection node and the specific routes taken to get there
-                    return node, p1[:idx1], p2[:idx2], branches[0], branches[1]
-                    
-            return None, None, None, None, None
 
         with tqdm(total=len(active_nodes), desc="Traversing Graph") as pbar:
             for start_idx in active_nodes:
@@ -281,14 +278,13 @@ class DeBruijnAssembler:
                         break # End of the line
                     
                     if out_count == 1:
-                        # STANDARD TRAVERSAL: Only one path forward
+                        # STANDARD TRAVERSAL
                         char_val = 0
                         for bit in range(4):
                             if out_mask & (1 << bit):
                                 char_val = bit
                                 break
                                 
-                        # Delete the edge so we don't travel it again in the future
                         working_edges[curr_idx] &= ~(1 << char_val) & 0xFF
                         pbar.update(1)
                         
@@ -305,38 +301,32 @@ class DeBruijnAssembler:
                         path.append(kmers_arr[curr_idx])
                         
                     elif out_count == 2:
-                        # OUTWARD BRANCH: Could be a biological repeat OR a sequencing error
-                        conv_node, p1_nodes, p2_nodes, b1, b2 = try_pop_bubble(curr_idx, out_mask)
+                        # OUTWARD BRANCH: Delegate bubble popping
+                        conv_node, p1_nodes, p2_nodes, b1, b2 = self._try_pop_bubble(
+                            curr_idx, out_mask, pointers, working_edges
+                        )
                         
                         if conv_node is not None:
                             # It was an error bubble! Safely resolve it.
-                            # 1. Clear the diverging start edges
                             working_edges[curr_idx] &= ~(1 << b1) & 0xFF
                             working_edges[curr_idx] &= ~(1 << b2) & 0xFF
                             pbar.update(1)
                             
-                            # 2. Clear internal bubble edges so the other path isn't traversed later
                             for n in p1_nodes + p2_nodes:
                                 working_edges[n] = 0
                                 
-                            # 3. Adopt Path 1 arbitrarily to bridge the gap in the assembly
                             for n in p1_nodes:
                                 path.append(kmers_arr[n])
                                 
-                            # 4. Jump directly to the convergence node to bypass the strict in-degree check
                             curr_idx = conv_node
                             path.append(kmers_arr[curr_idx])
                         else:
-                            # The paths didn't converge. It's a true biological repeat; stop to be safe.
+                            # True biological repeat; stop safely.
                             break
                     else:
                         break # Out-degree > 2 (Complex repetitive region, stop safely)
                     
-                # --- Graph Cleaning Part 2: Tip Removal ---
-                # Why: Sequencing errors at the *end* of a read create dead-end paths. 
-                # Because a single error corrupts exactly 'k' k-mers, error tips are usually 
-                # between length k and 2k. We drop anything shorter than 2k to purge noise 
-                # and prevent the N50 from plummeting.
+                # Graph Cleaning Part 2: Tip Removal
                 if len(path) >= 2 * self.k:
                     all_paths.append(path)
                 elif len(path) >= self.k:
@@ -344,7 +334,6 @@ class DeBruijnAssembler:
                     
         self.logger.info(f"Graph Cleaning: Pruned {tips_removed:,} dead-end tips.")
         return all_paths, tips_removed
-
     def _deduplicate_contigs(self, contigs):
         """
         Removes double-stranded duplicates and redundant sub-fragments.

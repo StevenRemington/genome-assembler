@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import argparse
 import logging
@@ -39,7 +37,7 @@ def setup_logger(enable_file_logging):
     return logger
 
 def print_stats(stats, logger):
-    """Cleanly formats statistics and ensures they are written to the log file."""
+    """Helper to cleanly format statistics and ensure they are written to the log file."""
     if not stats:
         logger.error("No statistics generated. Assembly may have failed.")
         return
@@ -50,42 +48,43 @@ def print_stats(stats, logger):
             logger.info(f"  - {key}: {value}")
     logger.info("-" * 40)
 
-def run_pipeline(filepath, file_format, min_overlap, max_mismatches, kmer_size, assembler_choice, enable_log, output_path):
+def run_pipeline(filepath, file_format, min_overlap, max_mismatches, kmer_size, min_cov, assembler_choice, enable_log, output_path):
     logger = setup_logger(enable_log)
     
-    logger.info(f"Loading sequence data from {filepath} (Format: {file_format.upper()})...")
-    reads = FastaIO.read(filepath, file_format=file_format)
-    
-    if not reads:
-        logger.error("No reads to process. Exiting.")
-        return
+    try:
+        logger.info(f"Loading sequence data from {filepath} (Format: {file_format.upper()})...")
+        reads = FastaIO.read(filepath, file_format=file_format)
         
-    logger.info(f"Successfully loaded {len(reads)} sequences.\n")
-    
-    # --- 1. Run Greedy Assembler ---
-    if assembler_choice in ["greedy", "both"]:
-        greedy_assembler = GreedyAssembler(min_overlap=min_overlap, max_mismatches=max_mismatches)
-        greedy_contigs, greedy_stats = greedy_assembler.assemble(reads)
-        print_stats(greedy_stats)
+        if not reads:
+            logger.error("No reads to process. Exiting.")
+            return
+            
+        logger.info(f"Successfully loaded {len(reads)} sequences.\n")
+        
+        # --- 1. Run Greedy Assembler ---
+        if assembler_choice in ["greedy", "both"]:
+            greedy_assembler = GreedyAssembler(min_overlap=min_overlap, max_mismatches=max_mismatches)
+            greedy_contigs, greedy_stats = greedy_assembler.assemble(reads)
+            print_stats(greedy_stats, logger)
 
-    # --- 2. Run De Bruijn Assembler ---
-    if assembler_choice in ["debruijn", "both"]:
-        try:
+        # --- 2. Run De Bruijn Assembler ---
+        if assembler_choice in ["debruijn", "both"]:
             read_stream = FastaIO.stream(filepath, file_format=file_format)
-            debruijn_assembler = DeBruijnAssembler(k=kmer_size, min_coverage=args.min_cov)
+            # Pass the new min_coverage parameter here!
+            debruijn_assembler = DeBruijnAssembler(k=kmer_size, min_coverage=min_cov)
             debruijn_contigs, debruijn_stats = debruijn_assembler.assemble(read_stream)
             print_stats(debruijn_stats, logger)
-        except Exception as e:
-            logger.error(f"Assembly pipeline failed: {e}")
-            return
-        
-        # Save the results ONLY if contigs were generated
-        if output_path and debruijn_contigs:
-            success = FastaIO.write(output_path, debruijn_contigs, header_prefix="debruijn_contig")
-            if success:
-                logger.info(f"Assembled sequence saved to: {output_path}")
-        else:
-            logger.warning("No contigs were generated. Output file was not created.")
+            
+            # Save the results ONLY if contigs were successfully generated
+            if output_path and debruijn_contigs:
+                success = FastaIO.write(output_path, debruijn_contigs, header_prefix="debruijn_contig")
+                if success:
+                    logger.info(f"Assembled sequence saved to: {output_path}")
+            else:
+                logger.warning("No contigs were generated. Output file was not created.")
+                
+    except Exception as e:
+        logger.error(f"Assembly pipeline failed: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble genome fragments with full logging.")
@@ -93,12 +92,16 @@ def main():
     parser.add_argument("-f", "--format", type=str, choices=["fasta", "fastq"], default="fastq")
     parser.add_argument("-a", "--assembler", type=str, choices=["greedy", "debruijn", "both"], default="both")
     
-    # Expose coverage threshold
-    parser.add_argument("-c", "--min-cov", type=int, default=15, help="Minimum k-mer coverage threshold")
-    parser.add_argument("-k", "--kmer", type=int, default=31, help="K-mer size (Max: 31)")
+    # Restored Greedy Assembler arguments
+    parser.add_argument("-o", "--overlap", type=int, default=10, help="Minimum overlap (Greedy)")
+    parser.add_argument("-m", "--mismatches", type=int, default=0, help="Max mismatches (Greedy)")
     
-    parser.add_argument("-s", "--save", type=str, help="Path to save the assembled FASTA file", default="assembled_genome.fasta")
-    # Fixed flag to standard format
+    # De Bruijn Assembler arguments
+    parser.add_argument("-k", "--kmer", type=int, default=31, help="K-mer size (Max: 31)")
+    parser.add_argument("-c", "--min-cov", type=int, default=20, dest="min_cov", help="Minimum k-mer coverage threshold")
+    
+    # --- NEW: Set default to None to trigger dynamic naming ---
+    parser.add_argument("-s", "--save", type=str, help="Path to save the assembled FASTA file", default=None)
     parser.add_argument("--log", action="store_true", help="Generate a detailed timestamped .log file")
     
     args = parser.parse_args()
@@ -108,13 +111,20 @@ def main():
         parser.error("K-mer size cannot exceed 31 due to 64-bit memory optimization limits.")
     if not os.path.exists(args.filepath):
         parser.error(f"Input file not found: {args.filepath}")
+        
+    # --- NEW: Dynamic Output Naming Logic ---
+    if args.save is None:
+        # 1. os.path.basename extracts just the filename (e.g., "BX45MS_1_AM0340_suppressor_2.fastq")
+        # 2. os.path.splitext splits the extension off -> ("BX45MS_1_AM0340_suppressor_2", ".fastq")
+        base_name = os.path.splitext(os.path.basename(args.filepath))[0]
+        args.save = f"{base_name}_assembled.fasta"
     
     run_pipeline(
         filepath=args.filepath, file_format=args.format,
         min_overlap=args.overlap, max_mismatches=args.mismatches,
-        kmer_size=args.kmer, assembler_choice=args.assembler,
-        enable_log=args.log,
-        output_path=args.save  # Pass the save path here
+        kmer_size=args.kmer, min_cov=args.min_cov, 
+        assembler_choice=args.assembler, enable_log=args.log,
+        output_path=args.save
     )
 
 if __name__ == "__main__":

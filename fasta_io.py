@@ -1,3 +1,4 @@
+import os
 try:
     from Bio import SeqIO
 except ImportError:

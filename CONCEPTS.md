@@ -11,8 +11,6 @@ Before building a graph, you must understand the data we are working with.
 * **Genome:** The complete set of DNA instructions found in a cell. DNA is made of four chemical bases: Adenine (**A**), Cytosine (**C**), Guanine (**G**), and Thymine (**T**).
 * **Double-Stranded / Reverse Complement:** DNA consists of two twisted strands. **A** always pairs with **T**, and **C** always pairs with **G**. Furthermore, the strands run in opposite directions.
 * If Strand 1 is `A-T-G-C`, Strand 2 is `G-C-A-T`. We call Strand 2 the **Reverse Complement (RC)**. Sequencers read from *both* strands randomly.
-
-
 * **Reads:** Modern sequencing machines cannot read an entire genome (millions of bases) from start to finish. Instead, they shatter the genome into millions of tiny fragments (usually 100-250 bases long) and read those. These fragments are called "reads".
 * **Coverage / Depth:** Because we randomly shatter the genome, we need to sequence it many times over to ensure every piece is captured. If a genome is 1 million bases long, and we generate 15 million bases worth of reads, we have **15x Coverage**.
 * **Contig:** A contiguous (continuous) sequence of DNA created by computationally overlapping our short reads. The goal of an assembler is to merge millions of reads into a handful of massive contigs.
@@ -44,11 +42,17 @@ Here is exactly how `debruijn_assembler.py` transforms raw sequence reads into a
 
 Instead of trying to find overlapping reads (which is mathematically too slow for millions of reads), we chop every single read into overlapping uniform strings of length $k$ (e.g., $k=4$).
 
-**Read:** `ATGCA`
-**k-mers (k=4):** 1. `ATGC`
-2. `TGCA`
+We then count how many times each k-mer appears across the entire dataset. If a k-mer only appears a few times, it is a random machine error and is discarded.
 
-In the codebase, `DNAEncoder` converts these directly into 2-bit integers. We then count how many times each k-mer appears across all millions of reads. If a k-mer only appears 1 or 2 times, it's almost certainly a sequencing machine error. We throw it away (Controlled by `min_coverage`).
+```text
+RAW READ: A T G C A T
+(Chopping with k=4)
+
+1. [A T G C] (Count: 25) -> TRUSTED (Keep)
+2.   [T G C A] (Count: 20) -> TRUSTED (Keep)
+3.     [G C A T] (Count: 2)  -> NOISE (Discard & destroy)
+
+```
 
 ### Step 2: Building the Graph (Nodes & Edges)
 
@@ -56,80 +60,100 @@ For every surviving (trusted) full k-mer, we split it to define our graph.
 
 * **Node (Prefix):** The first $k-1$ characters.
 * **Next Node (Suffix):** The last $k-1$ characters.
-
-For the k-mer `ATGC` (length 4):
-
-* Prefix Node: `ATG`
-* Suffix Node: `TGC`
-* Edge: `C` (The character that transitions `ATG` into `TGC`).
+* **Edge:** The final character that connects them.
 
 ```text
-       (Edge: C)
-[ATG] ----------> [TGC]
+Full K-mer: A T G C
+            
+   Prefix (Node)      Suffix (Next Node)
+     [A T G] ------------> [T G C]
+                Edge: C
 
 ```
 
-By doing this for millions of k-mers, a massive interconnected web is formed.
+By linking millions of these prefix/suffix pairs together, a massive interconnected web is formed.
 
-### Step 3: Fast Graph Traversal
+### Step 3: Fast Graph Traversal & Bubble Popping
 
-To assemble the genome, we just "walk" along the arrows. However, the graph is not a perfect straight line. It has branches and convergences due to repeating sequences in the genome.
+To assemble the genome, the algorithm "walks" along the arrows, recording characters as it goes.
 
-**The Traversal Rules (`_extract_contigs`):**
-
-1. Start at a random active node.
-2. Follow the outgoing edge to the next node.
-3. Keep walking and recording bases until you hit a **Stop Condition**.
-
-**Stop Condition 1: Outward Branch (Out-degree > 1)**
-The path splits. We don't know which way the true genome goes, so we safely stop the contig here.
+**Standard Walk:**
 
 ```text
-                  ---> [GCA] (Path A)
-                 /
-[ATG] ---> [TGC] 
-                 \
-                  ---> [GCC] (Path B)
+[ATG] ---> [TGC] ---> [GCA] ---> [CAT]  =  A T G C A T
 
 ```
 
-**Stop Condition 2: Convergence (In-degree > 1)**
-Two different paths merge into the same node. If we just blindly kept walking, we might accidentally glue Path X's beginning to Path Y's end, creating a biological **Chimera**. We safely stop.
+However, biology and sequencing aren't perfect. The graph has tangles that the walker must safely navigate:
+
+**Event A: Bubble Popping (Resolving Minor Errors)**
+If a single DNA letter is misread by the machine, the graph temporarily splits into two paths, but immediately merges back together a few steps later (a "bubble"). The algorithm detects this, pops the error path, and bridges the gap.
+
+```text
+                   ---> [GCA] (Error path) ---
+                  /                           \
+[ATG] ---> [TGC]                               ---> [CAT] ---> [ATG]
+                  \                           /
+                   ---> [GTA] (True path)  ---
+
+Result: Bubble Popped! Traversal safely continues.
+
+```
+
+**Event B: True Divergence (Stop Condition 1)**
+If a path splits and *doesn't* come back together, it means the graph hit a repeating DNA sequence that exists in multiple different chromosomes. The walker safely stops to avoid guessing.
+
+```text
+                   ---> [GCA] ---> [CAA] (To Chromosome 1)
+                  /                           
+[ATG] ---> [TGC]                               
+                  \                           
+                   ---> [GCC] ---> [CCT] (To Chromosome 2)
+
+Result: Stop walking. Output the sequence up to this point.
+
+```
+
+**Event C: Convergence (Stop Condition 2)**
+If two completely different paths merge into the same node, walking further could accidentally glue Path X's beginning to Path Y's end, creating a biological **Chimera**. The walker safely stops.
 
 ```text
 [ATA] ---> \
             ---> [TGC] ---> [GCA]
 [GTA] ---> /
 
+Result: Stop walking to prevent creating a Chimera.
+
 ```
 
-*Code Note:* In `debruijn_assembler.py`, we pre-compute an `in_degrees` array and transition `pointers`. This allows the walker to move in $O(1)$ constant time, evaluating millions of steps per second.
+### Step 4: Tip Removal (Error Pruning)
 
-### Step 4: Tip Removal (Error Correction)
+Even with k-mer filtering, sequencing errors at the very *ends* of reads can create tiny, dead-end branches in the graph known as "tips".
 
-Even with k-mer filtering, sequencing errors at the very ends of reads can create tiny, dead-end branches in the graph known as "tips".
+Because a single error corrupts exactly $k$ k-mers, these tips are usually between length $k$ and $2k$. After traversal, the algorithm measures all extracted paths. If a path is a dead end and shorter than $2k$, it is vaporized.
 
 ```text
-                  ---> [TGA] ---> [GAC] (True Genome Path)
-                 /
+                   ---> [TGA] ---> [GAC] ---> [ACT] (True Genome Path, Length > 2k. KEEP)
+                  /
 [ATG] ---> [TGC] 
-                 \
-                  ---> [TGT] (Dead end / Error Tip)
+                  \
+                   ---> [TGT] (Dead end Tip, Length < 2k. PRUNE & DELETE)
 
 ```
-
-After traversal, the algorithm looks at all the paths it extracted. If a path is shorter than `2 * k`, it is assumed to be an error tip and is permanently deleted.
 
 ### Step 5: Dense K-mer Deduplication (Solving the Double-Strand Problem)
 
-Because the sequencing machine reads from both the forward DNA strand and the reverse complement (RC) strand, our traversal naturally outputs **two complete genomes**: The Forward Genome and the RC Genome.
+Because the sequencing machine reads from both the forward DNA strand and the reverse complement (RC) strand, our traversal naturally outputs **two complete genomes**: The Forward Genome and the RC Mirror Genome.
 
-If the true genome is 2.8 million bases, the traversal outputs 5.6 million bases.
+To isolate the true haploid genome, the deduplicator compares all contigs against each other. If a contig is found to be a mirror of one we already have, it is discarded.
 
-To fix this, the assembler runs `_deduplicate_contigs`:
+```text
+Extracted Contigs:
 
-1. We sort the extracted contigs from longest to shortest.
-2. We take the longest contig, accept it, and add **every single one of its k-mers** (and their reverse complements) into a `seen_kmers` database.
-3. We move to the next contig. We sample roughly 100 test k-mers across its length.
-4. If the majority of those test k-mers already exist in our `seen_kmers` database, we know this contig is just the reverse-complement mirror (or an overlapping redundant fragment) of a contig we already accepted.
-5. We safely delete the mirror, cutting the total output size precisely in half to reveal the true haploid genome.
+Contig 1: [A T G C G T A C G T A G]  --> KEEP (Forward Strand)
+Contig 2: [C T A C G T A C G C A T]  --> DISCARD (100% Reverse Complement match to Contig 1)
+Contig 3: [G G G C C C A A A T T T]  --> KEEP (New Sequence)
+
+Final Output: Contig 1, Contig 3.
+
+```
